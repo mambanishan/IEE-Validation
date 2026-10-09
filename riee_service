@@ -1,0 +1,912 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+riee_service.py — headless UDP validation service for ITCs integration.
+
+NEW FILE (replaces the DLL integration path entirely).
+
+Flow
+----
+    ITCs  --FILE_READY-->  [our port]        this service
+    ITCs  <--OK/NO_FILE--  [ITCs port]       immediate receipt
+    ITCs  <--RESULT------  [ITCs port]       verdict, seconds later
+
+The receipt (OK / NO_FILE) answers only "did I find your file".
+The verdict arrives later as a separate RESULT message.
+
+Run:
+    python riee_service.py                    # uses ./service_config.ini
+    python riee_service.py -c other.ini
+    python riee_service.py --make-config      # write a default ini and exit
+"""
+
+import os
+import re
+import sys
+import json
+import time
+import queue
+import socket
+import shutil
+import logging
+import argparse
+import threading
+import importlib.util
+import configparser
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_CONFIG = """\
+[network]
+# Port THIS service listens on for FILE_READY from ITCs.
+listen_host = 127.0.0.1
+# ITCs SENDS to this port — confirmed by observing traffic arrive on 333.
+listen_port = 333
+# Fallback reply target, used only when reply_to_sender is false or no
+# message has been received yet.
+itcs_host   = 127.0.0.1
+itcs_port   = 222
+# Reply to the address the datagram actually came from. ITCs sends from an
+# ephemeral port, so this is more reliable than a fixed reply port.
+reply_to_sender = true
+# Retry an unacknowledged RESULT this many times, this far apart.
+retry_count    = 3
+retry_delay_s  = 0.5
+# Heartbeat to ITCs. 0 = off (default). ITCs does not ask for it, and an
+# unexpected datagram arriving mid UDP_WaitForMessage is only noise, so leave
+# this at 0 unless something on the ITCs side actually wants it.
+heartbeat_s    = 0
+# If true, also accept a bare filename as plain text (no JSON) and reply
+# with the literal words "ok" / "no file". Set false once ITCs speaks JSON.
+plain_text_mode = true
+# When to send "ok":
+#   validated = after validation of the file (or whole folder) has finished
+#   received  = as soon as the file is found, before validating
+ok_when = validated
+# How the "ok" is sent once validation is finished:
+#   manual = the GUI shows a "SendOK?" dialog; clicking Ok sends it
+#   auto   = sent immediately, no dialog
+# With no GUI attached (command-line run) manual falls back to auto.
+ok_mode = manual
+# Exact reply text. ITCs waits with UDP_WaitForMessage ..., 'Ok' - the
+# comparison may be case-sensitive, so this must match ITCs character for
+# character.
+ok_text      = Ok
+# Sent automatically (no dialog) when nothing can be validated.
+# {target} = the path ITCs sent, {reason} = why nothing was found.
+no_file_text = WARNING NO_FILE {target} ({reason})
+# Sent just BEFORE the Ok when a folder held nothing new, so ITCs can tell
+# "validated just now" from "already done earlier". Leave empty to send only
+# the Ok. {target} = path ITCs sent, {files} = how many .Riee were found.
+already_text = WARNING ALREADY_VALIDATED {target} ({files} file(s) already validated)
+# How long ITCs waits for the reply (UDP_WaitForMessage timeout, in s).
+# Only used to show a countdown in the SendOK dialog.
+itcs_timeout_s = 60
+# Also send the JSON RESULT datagram. ITCs only understands "ok", so this is
+# off by default to avoid sending it text it cannot parse.
+send_json_result = false
+
+[paths]
+# Root folder ITCs records into. Only used when ITCs sends a bare file NAME;
+# a full path in the message is used as-is.
+root = D:\\Data\\TestRawDataRadar
+# What a folder sweep validates:
+#   always   = every .Riee at that location, every time ITCs asks (end-user
+#              mode: the answer never depends on what ran before)
+#   new_only = skip files validated in an earlier run, and send the
+#              already_text notice instead
+revalidate = always
+# ITCs sends absolute paths (checkFile <full path>). Accept them.
+allow_absolute_paths = true
+# If true, refuse any absolute path that is not underneath root.
+restrict_to_root = false
+# Device subfolders searched when resolving a bare filename, in order.
+device_folders = dev0F, dev1F, dev2F, dev3F, dev4F
+# Class mapping CSV used by the validator engine.
+class_csv = class_mapping.csv
+# Path to the validator engine module.
+engine = riee_validator_v16py.py
+# Service working files (index + log). NOT inside the watched root.
+work_dir = C:\\temp\\riee_service
+
+[sorting]
+# Subfolder names created inside the recording folder.
+pass_folder     = Pass
+fail_folder     = Warn_Fail
+mismatch_folder = Device_Mismatch
+# Originals are never moved. Copy only.
+copy_only = true
+# plot_mode: none | simple | all | pass | flagged
+plot_mode = all
+
+[rules]
+# Enforce dev<N>F folder  <->  _d<N>_ filename token.
+device_check = true
+# If true a mismatch is reported without running signal validation.
+device_check_blocking = true
+
+[logging]
+level         = INFO
+max_bytes     = 5242880
+backup_count  = 5
+"""
+
+
+class Config:
+    def __init__(self, path):
+        cp = configparser.ConfigParser()
+        cp.read_string(DEFAULT_CONFIG)
+        if path and os.path.isfile(path):
+            cp.read(path, encoding="utf-8")
+        self.cp = cp
+
+        self.listen_host = cp.get("network", "listen_host")
+        self.listen_port = cp.getint("network", "listen_port")
+        self.itcs_host = cp.get("network", "itcs_host")
+        self.itcs_port = cp.getint("network", "itcs_port")
+        self.retry_count = cp.getint("network", "retry_count")
+        self.retry_delay_s = cp.getfloat("network", "retry_delay_s")
+        self.heartbeat_s = cp.getfloat("network", "heartbeat_s")
+        self.plain_text_mode = cp.getboolean("network", "plain_text_mode")
+        self.reply_to_sender = cp.getboolean("network", "reply_to_sender")
+        self.ok_when = cp.get("network", "ok_when").strip().lower()
+        self.ok_mode = cp.get("network", "ok_mode").strip().lower()
+        self.ok_text = cp.get("network", "ok_text")
+        self.no_file_text = cp.get("network", "no_file_text")
+        self.already_text = cp.get("network", "already_text")
+        self.itcs_timeout_s = cp.getfloat("network", "itcs_timeout_s")
+        self.send_json_result = cp.getboolean("network", "send_json_result")
+
+        self.root = cp.get("paths", "root")
+        self.device_folders = [d.strip() for d in
+                               cp.get("paths", "device_folders").split(",") if d.strip()]
+        self.revalidate = cp.get("paths", "revalidate").strip().lower()
+        self.allow_absolute_paths = cp.getboolean("paths", "allow_absolute_paths")
+        self.restrict_to_root = cp.getboolean("paths", "restrict_to_root")
+        self.class_csv = cp.get("paths", "class_csv")
+        self.engine = cp.get("paths", "engine")
+        self.work_dir = cp.get("paths", "work_dir")
+
+        self.pass_folder = cp.get("sorting", "pass_folder")
+        self.fail_folder = cp.get("sorting", "fail_folder")
+        self.mismatch_folder = cp.get("sorting", "mismatch_folder")
+        self.copy_only = cp.getboolean("sorting", "copy_only")
+        self.plot_mode = cp.get("sorting", "plot_mode")
+
+        self.device_check = cp.getboolean("rules", "device_check")
+        self.device_check_blocking = cp.getboolean("rules", "device_check_blocking")
+
+        self.log_level = cp.get("logging", "level")
+        self.log_max_bytes = cp.getint("logging", "max_bytes")
+        self.log_backups = cp.getint("logging", "backup_count")
+
+    @property
+    def sorted_folder_names(self):
+        """Folders we create ourselves — must never be scanned or resolved into."""
+        return {self.pass_folder.lower(),
+                self.fail_folder.lower(),
+                self.mismatch_folder.lower()}
+
+
+log = logging.getLogger("riee_service")
+
+
+def setup_logging(cfg):
+    os.makedirs(cfg.work_dir, exist_ok=True)
+    log.setLevel(getattr(logging, cfg.log_level.upper(), logging.INFO))
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s",
+                            "%Y-%m-%d %H:%M:%S")
+    fh = RotatingFileHandler(os.path.join(cfg.work_dir, "riee_service.log"),
+                             maxBytes=cfg.log_max_bytes,
+                             backupCount=cfg.log_backups, encoding="utf-8")
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    log.addHandler(fh)
+    log.addHandler(sh)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENGINE LOADING
+# Import riee_validator_v16py.py by path so the service does not depend on
+# the engine sitting on sys.path or being installed as a package.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Engine:
+    def __init__(self, module_path):
+        p = Path(module_path)
+        if not p.is_absolute():
+            p = Path(__file__).parent / p
+        if not p.is_file():
+            raise FileNotFoundError(f"validator engine not found: {p}")
+        spec = importlib.util.spec_from_file_location("riee_engine", str(p))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.m = mod
+        log.info("engine loaded from %s", p)
+
+    def load_mapping(self, csv_path):
+        if csv_path and os.path.isfile(csv_path):
+            return self.m.load_class_mapping(csv_path)
+        log.warning("class mapping CSV not found (%s) — continuing without it",
+                    csv_path)
+        return {}
+
+    def parse_filename(self, path):
+        return self.m.parse_filename(path)
+
+    def validate_file(self, path, mapping, plot_mode, plot_dir):
+        return self.m.validate_file(path, mapping, plot_mode, plot_dir)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PERSISTENT INDEX
+# Keyed on name+size+mtime so a service restart does not reprocess the folder,
+# but a genuinely re-recorded file (new mtime/size) is picked up again.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FileIndex:
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._d = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self._d = json.load(f)
+            log.info("index loaded: %d entries", len(self._d))
+        except Exception:
+            self._d = {}
+
+    @staticmethod
+    def key(filepath):
+        st = os.stat(filepath)
+        return f"{Path(filepath).name}|{st.st_size}|{int(st.st_mtime)}"
+
+    def seen(self, filepath):
+        try:
+            return self.key(filepath) in self._d
+        except OSError:
+            return False
+
+    def get(self, filepath):
+        try:
+            return self._d.get(self.key(filepath))
+        except OSError:
+            return None
+
+    def record(self, filepath, result):
+        with self._lock:
+            try:
+                self._d[self.key(filepath)] = result
+            except OSError:
+                return
+            tmp = self.path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self._d, f, indent=1)
+                os.replace(tmp, self.path)
+            except Exception as e:
+                log.error("index write failed: %s", e)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NAME RESOLUTION + DEVICE RULE
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEV_FOLDER_RE = re.compile(r"^dev(\d+)F$", re.IGNORECASE)
+
+# ITCs sends:  checkFile  <full Windows path to the .Riee file>
+# The leading command word is stripped before the path is used.
+CMD_RE = re.compile(r"^\s*(checkfile|check_file|validate|file_ready|ping"
+                    r"|rawdatafilename|rawdatafile)\b[\s,:]*",
+                    re.IGNORECASE)
+
+
+def split_command(text):
+    """Return (command, argument). Command is '' when none is present."""
+    t = (text or "").strip().strip('"')
+    m = CMD_RE.match(t)
+    if m:
+        return m.group(1).lower(), t[m.end():].strip().strip('"')
+    return "", t
+
+
+def _basename(s):
+    """Basename that works for Windows paths even when running on Linux."""
+    return s.replace("\\", "/").rstrip("/").split("/")[-1]
+
+
+def _under_root(path, root):
+    try:
+        return os.path.commonpath([os.path.abspath(path),
+                                   os.path.abspath(root)]) == os.path.abspath(root)
+    except Exception:
+        return False
+
+
+def resolve_filename(cfg, name):
+    """
+    ITCs sends a bare file name. Resolve it to a real path under root.
+
+    Returns (path, None) on success, (None, reason) on failure.
+    Sorted output folders are skipped so we can never resolve onto one of
+    our own copies.
+    """
+    name = (name or "").strip().strip('"')
+    if not name:
+        return None, "empty filename"
+
+    # ── ITCs sends a FULL PATH. Use it directly when it resolves.
+    if cfg.allow_absolute_paths and ("/" in name or "\\" in name or ":" in name):
+        p = os.path.normpath(name)
+        if os.path.isfile(p):
+            if cfg.restrict_to_root and not _under_root(p, cfg.root):
+                return None, "outside configured root"
+            if not os.access(p, os.R_OK):
+                return None, "unreadable"
+            return p, None
+        # Path did not resolve — fall back to searching root by its basename.
+        name = _basename(p)
+
+    name = _basename(name)
+    if not os.path.splitext(name)[1]:
+        name += ".Riee"
+
+    root = cfg.root
+    if not os.path.isdir(root):
+        return None, f"root folder not found: {root}"
+
+    hits = []
+    # Search root itself, then each configured device folder.
+    candidates = [root] + [os.path.join(root, d) for d in cfg.device_folders]
+    for folder in candidates:
+        if not os.path.isdir(folder):
+            continue
+        if Path(folder).name.lower() in cfg.sorted_folder_names:
+            continue
+        p = os.path.join(folder, name)
+        if os.path.isfile(p):
+            hits.append(p)
+
+    if not hits:
+        return None, "not found"
+    if len(hits) > 1:
+        # Ambiguous: same name in two device folders. Reported, not guessed.
+        log.warning("ambiguous name %s -> %s", name, hits)
+        return None, f"ambiguous: found in {len(hits)} folders"
+    if not os.access(hits[0], os.R_OK):
+        return None, "unreadable"
+    return hits[0], None
+
+
+def _riee_in(folder):
+    """Direct .Riee children of a folder. Not recursive, so our own Pass,
+    Warn_Fail and Device_Mismatch subfolders are never entered."""
+    try:
+        return sorted(os.path.join(folder, f) for f in os.listdir(folder)
+                      if f.lower().endswith(".riee")
+                      and os.path.isfile(os.path.join(folder, f)))
+    except OSError:
+        return []
+
+
+def resolve_target(cfg, arg):
+    """
+    What did ITCs point at?
+
+      a file                         -> ("file",   [path])
+      a device folder (dev0F ...)    -> ("folder", [every .Riee inside])
+      the recording root             -> ("folder", [every .Riee in every devNF])
+      nothing usable                 -> (None,     reason)
+    """
+    a = (arg or "").strip().strip('"').rstrip("\\/")
+    if a and os.path.isdir(a):
+        if Path(a).name.lower() in cfg.sorted_folder_names:
+            return None, "that is an output folder, not a recording folder"
+        subs = [os.path.join(a, d) for d in cfg.device_folders
+                if os.path.isdir(os.path.join(a, d))]
+        files = _riee_in(a)
+        for d in subs:            # root given: sweep every device folder
+            files += _riee_in(d)
+        if not files:
+            return None, "no .Riee files in folder"
+        return "folder", files
+
+    path, reason = resolve_filename(cfg, arg)
+    if path is None:
+        return None, reason
+    return "file", [path]
+
+
+def device_check(engine, filepath):
+    """
+    dev<N>F folder  must match  _d<N>_ token in the filename.
+
+    Returns (ok: bool, detail: str).
+    """
+    folder = Path(filepath).parent.name
+    m = DEV_FOLDER_RE.match(folder)
+    if not m:
+        return True, "not in a device folder — check skipped"
+    expected = int(m.group(1))
+    meta = engine.parse_filename(filepath)
+    tok = meta.get("device")
+    if tok is None:
+        return False, f"folder {folder} but filename has no device token"
+    actual = int(tok)
+    if actual == expected:
+        return True, f"d{actual} in {folder}"
+    return False, f"d{actual} found in {folder} (expected d{expected})"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VALIDATION WORKER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Validator:
+    def __init__(self, cfg, engine, index):
+        self.cfg = cfg
+        self.engine = engine
+        self.index = index
+        self.mapping = engine.load_mapping(cfg.class_csv)
+
+    def _dest_folder(self, filepath, verdict):
+        cfg = self.cfg
+        base = Path(filepath).parent
+        if verdict == "DEVICE_MISMATCH":
+            sub = cfg.mismatch_folder
+        elif verdict == "PASS":
+            sub = cfg.pass_folder
+        else:
+            sub = cfg.fail_folder
+        d = base / sub
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def process(self, filepath):
+        cfg = self.cfg
+        t0 = time.time()
+        name = Path(filepath).name
+
+        # ── Rule check first: a misfiled file is a routing fault, not a
+        #    data-quality fault, and gets its own verdict class.
+        dev_ok, dev_detail = (True, "disabled")
+        if cfg.device_check:
+            dev_ok, dev_detail = device_check(self.engine, filepath)
+            if not dev_ok and cfg.device_check_blocking:
+                dest = self._dest_folder(filepath, "DEVICE_MISMATCH")
+                out = str(dest / name)
+                try:
+                    shutil.copy2(filepath, out)
+                except Exception as e:
+                    log.error("copy failed %s: %s", name, e)
+                    out = ""
+                res = {"filename": name, "verdict": "DEVICE_MISMATCH",
+                       "comment": dev_detail, "device_check": dev_detail,
+                       "sorted_path": out, "plot_path": "",
+                       "duration_s": round(time.time() - t0, 2)}
+                self.index.record(filepath, res)
+                return res
+
+        # ── Signal validation
+        plot_dir = os.path.join(cfg.work_dir, "plots")
+        try:
+            r = self.engine.validate_file(filepath, self.mapping,
+                                          cfg.plot_mode, plot_dir)
+        except Exception as e:
+            log.exception("validate_file crashed on %s", name)
+            return {"filename": name, "verdict": "ERROR",
+                    "comment": f"ERROR:ENGINE ({e})", "device_check": dev_detail,
+                    "sorted_path": "", "plot_path": "",
+                    "duration_s": round(time.time() - t0, 2)}
+
+        verdict = r.get("verdict", "ERROR")
+        dest = self._dest_folder(filepath, verdict)
+
+        # Copy, never move — the originals belong to ITCs.
+        out = ""
+        try:
+            out = str(dest / name)
+            shutil.copy2(filepath, out)
+        except Exception as e:
+            log.error("copy failed %s: %s", name, e)
+            out = ""
+
+        # Carry the plot alongside its file.
+        plot_out = ""
+        pf = r.get("_plot_file", "")
+        if pf and os.path.isfile(pf):
+            try:
+                plot_out = str(dest / Path(pf).name)
+                shutil.copy2(pf, plot_out)
+            except Exception as e:
+                log.error("plot copy failed %s: %s", name, e)
+                plot_out = ""
+
+        res = {"filename": name,
+               "verdict": verdict,
+               "comment": r.get("comment", ""),
+               "device_check": dev_detail,
+               "sorted_path": out,
+               "plot_path": plot_out,
+               "duration_s": round(time.time() - t0, 2)}
+        self.index.record(filepath, res)
+        return res
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UDP SERVICE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Service:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        os.makedirs(cfg.work_dir, exist_ok=True)
+        self.engine = Engine(cfg.engine)
+        self.index = FileIndex(os.path.join(cfg.work_dir, "validated_index.json"))
+        self.validator = Validator(cfg, self.engine, self.index)
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((cfg.listen_host, cfg.listen_port))
+        self.sock.settimeout(1.0)
+
+        self.q = queue.Queue()
+        self.stop = threading.Event()
+        self.seen_msgs = {}          # msg_id -> time, for de-duplicating retries
+        self.pending = {}            # msg_id -> retry state for our RESULTs
+        self._lock = threading.Lock()
+        self._n = 0
+        self.last_peer = None        # source address of the last datagram in
+        self.awaiting = {}           # token -> job waiting for a manual Ok click
+        self.on_event = None         # optional GUI callback(kind, dict)
+
+    # ── wire helpers ────────────────────────────────────────────────────────
+    def _next_id(self):
+        with self._lock:
+            self._n += 1
+            return f"S{int(time.time())}{self._n:04d}"
+
+    def peer(self):
+        """Where replies go: the sender's own address when known."""
+        if self.cfg.reply_to_sender and self.last_peer:
+            return self.last_peer
+        return (self.cfg.itcs_host, self.cfg.itcs_port)
+
+    def no_file_msg(self, target, reason):
+        """Fill the no-file template. Falls back to a fixed line if the
+        template in the config is malformed, so a typo never blocks the reply."""
+        try:
+            return self.cfg.no_file_text.format(target=target, reason=reason)
+        except (KeyError, IndexError, ValueError):
+            return f"WARNING NO_FILE {target} ({reason})"
+
+    def send(self, obj, plain=None, reliable=False, addr=None):
+        cfg = self.cfg
+        addr = addr or self.peer()
+        if plain is not None and cfg.plain_text_mode:
+            data = plain.encode("utf-8")
+        else:
+            data = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+        if len(data) > 1400:
+            log.warning("datagram %d bytes — over the 1400 fragmentation limit",
+                        len(data))
+        try:
+            self.sock.sendto(data, addr)
+            log.info("TX %s -> %s:%d  %s", obj.get("type", "?"),
+                     addr[0], addr[1], data[:200].decode("utf-8", "replace"))
+        except Exception as e:
+            log.error("send failed: %s", e)
+            return
+        if reliable:
+            with self._lock:
+                self.pending[obj["msg_id"]] = {"data": data, "tries": 1,
+                                               "next": time.time() + cfg.retry_delay_s}
+
+    # ── threads ─────────────────────────────────────────────────────────────
+    def receiver(self):
+        log.info("listening on %s:%d", self.cfg.listen_host, self.cfg.listen_port)
+        while not self.stop.is_set():
+            try:
+                data, addr = self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            text = data.decode("utf-8", "replace").strip()
+            self.last_peer = addr
+            log.info("RX from %s:%d  %s", addr[0], addr[1], text[:200])
+            if self.on_event:
+                self.on_event("rx", {"addr": f"{addr[0]}:{addr[1]}", "text": text})
+            try:
+                self.handle(text, addr)
+            except Exception:
+                log.exception("handler failed")
+
+    def handle(self, text, addr):
+        # Plain-text fallback: a bare filename with no JSON wrapper.
+        if not text.startswith("{"):
+            if not self.cfg.plain_text_mode:
+                log.warning("non-JSON message ignored (plain_text_mode off)")
+                return
+            cmd, arg = split_command(text)
+            if cmd in ("rawdatafilename", "rawdatafile"):
+                # ITCs announces a raw-data file name. Nothing to validate —
+                # acknowledge so ITCs can carry on.
+                log.info("RawDataFileName: %s", arg)
+                self.send({"type": "OK", "msg_id": self._next_id(),
+                           "note": "RawDataFileName acknowledged",
+                           "filename": arg},
+                          plain=self.cfg.ok_text)
+                return
+            if cmd == "ping":
+                self.send({"type": "ALIVE", "msg_id": self._next_id()}, plain=self.cfg.ok_text)
+                return
+            if not arg:
+                log.warning("command with no argument: %r", text)
+                self.send({"type": "NO_FILE", "msg_id": self._next_id(),
+                           "filename": "", "reason": "no path in message"},
+                          plain=self.no_file_msg("", "no path in message"))
+                return
+            self.on_file_ready({"msg_id": self._next_id(), "filename": arg},
+                               plain=True)
+            return
+
+        msg = json.loads(text)
+        mtype = (msg.get("type") or "").upper()
+        mid = msg.get("msg_id", "")
+
+        if mtype == "ACK":
+            with self._lock:
+                self.pending.pop(msg.get("ack_of", ""), None)
+            return
+
+        # De-duplicate retries of the same request.
+        if mid:
+            with self._lock:
+                if mid in self.seen_msgs:
+                    log.info("duplicate %s ignored", mid)
+                    return
+                self.seen_msgs[mid] = time.time()
+
+        if mtype == "FILE_READY":
+            self.on_file_ready(msg, plain=False)
+        elif mtype in ("RAWDATAFILENAME", "RAW_DATA_FILE_NAME"):
+            log.info("RawDataFileName: %s", msg.get("filename", ""))
+            self.send({"type": "OK", "msg_id": self._next_id(), "ack_of": mid,
+                       "note": "RawDataFileName acknowledged"},
+                      plain=self.cfg.ok_text)
+        elif mtype == "PING":
+            self.send({"type": "ALIVE", "msg_id": self._next_id(),
+                       "ack_of": mid}, plain=self.cfg.ok_text)
+        else:
+            log.warning("unknown message type: %s", mtype)
+
+    def on_file_ready(self, msg, plain):
+        arg = (msg.get("filename") or "").strip()
+        mid = msg.get("msg_id", "")
+        addr = self.peer()            # remember who asked; reply goes there
+        kind, found = resolve_target(self.cfg, arg)
+
+        if kind is None:
+            self.send({"type": "NO_FILE", "msg_id": self._next_id(),
+                       "ack_of": mid, "filename": arg, "reason": found},
+                      plain=self.no_file_msg(arg, found) if plain else None,
+                      addr=addr)
+            log.warning("NO_FILE %s (%s)", arg, found)
+            return
+
+        if kind == "folder":
+            if self.cfg.revalidate == "always":
+                todo = found
+                log.info("folder %s: %d .Riee, validating all", arg, len(found))
+            else:
+                # Skip what an earlier run already did.
+                todo = [p for p in found if not self.index.seen(p)]
+                log.info("folder %s: %d .Riee, %d new", arg, len(found), len(todo))
+            if not todo:
+                # Everything here was validated in an earlier run. Tell ITCs
+                # the scenario first, then still send the Ok it waits for.
+                if self.cfg.already_text.strip():
+                    try:
+                        txt = self.cfg.already_text.format(target=arg,
+                                                           files=len(found))
+                    except (KeyError, IndexError, ValueError):
+                        txt = (f"WARNING ALREADY_VALIDATED {arg} "
+                               f"({len(found)} file(s) already validated)")
+                    self.send({"type": "ALREADY_VALIDATED",
+                               "msg_id": self._next_id(), "ack_of": mid,
+                               "filename": arg, "files": len(found)},
+                              plain=txt if plain else None, addr=addr)
+                    log.warning("ALREADY_VALIDATED %s (%d file(s))", arg, len(found))
+                self._finish({"mid": mid, "target": arg, "paths": [],
+                              "plain": plain, "addr": addr, "t0": time.time()},
+                             {})
+                return
+        else:
+            todo = found
+
+        if self.cfg.ok_when == "received":
+            self.send({"type": "OK", "msg_id": self._next_id(), "ack_of": mid,
+                       "filename": arg, "files": len(todo)},
+                      plain=self.cfg.ok_text if plain else None, addr=addr)
+
+        self.q.put({"mid": mid, "target": arg, "paths": todo,
+                    "plain": plain, "addr": addr, "t0": time.time()})
+
+    def worker(self):
+        while not self.stop.is_set():
+            try:
+                job = self.q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            counts = {}
+            try:
+                for path in job["paths"]:
+                    if self.stop.is_set():
+                        break
+                    try:
+                        res = self.validator.process(path)
+                    except Exception:
+                        log.exception("worker failed on %s", path)
+                        continue
+                    v = res.get("verdict", "ERROR")
+                    counts[v] = counts.get(v, 0) + 1
+                    log.info("%-15s %s", v, res.get("filename", ""))
+                    if self.on_event:
+                        self.on_event("result", res)
+                    if self.cfg.send_json_result:
+                        out = {"type": "RESULT", "msg_id": self._next_id(),
+                               "ack_of": job["mid"]}
+                        out.update(res)
+                        self.send(out, reliable=True, addr=job["addr"])
+
+                self._finish(job, counts)
+            finally:
+                self.q.task_done()
+
+    def _finish(self, job, counts):
+        """
+        Validation of a job is done. Either send "Ok" now (auto), or park the
+        job and ask the GUI to show the SendOK dialog (manual).
+        """
+        job["counts"] = counts
+        info = {"target": job["target"], "total": len(job["paths"]),
+                "counts": counts}
+        if self.cfg.ok_when != "validated":
+            # "Ok" already went out on receipt.
+            if self.on_event:
+                self.on_event("batch_done", info)
+            return
+
+        manual = self.cfg.ok_mode == "manual" and self.on_event is not None
+        if not manual:
+            self._send_ok(job)
+            if self.on_event:
+                self.on_event("batch_done", info)
+            return
+
+        token = self._next_id()
+        with self._lock:
+            self.awaiting[token] = job
+        log.info("waiting for user to confirm Ok (%s)", job["target"])
+        info.update({"token": token, "t0": job["t0"],
+                     "timeout_s": self.cfg.itcs_timeout_s})
+        self.on_event("awaiting_ok", info)
+
+    def _send_ok(self, job):
+        self.send({"type": "OK", "msg_id": self._next_id(),
+                   "ack_of": job["mid"], "filename": job["target"],
+                   "files": len(job["paths"]), "counts": job.get("counts", {})},
+                  plain=self.cfg.ok_text if job["plain"] else None,
+                  addr=job["addr"])
+
+    def confirm_ok(self, token):
+        """Called by the GUI when the user clicks Ok in the SendOK dialog."""
+        with self._lock:
+            job = self.awaiting.pop(token, None)
+        if job is None:
+            log.warning("confirm_ok: unknown or already-sent token %s", token)
+            return False
+        late = time.time() - job["t0"]
+        if late > self.cfg.itcs_timeout_s:
+            log.warning("Ok sent %.0f s after request - past ITCs timeout of %.0f s",
+                        late, self.cfg.itcs_timeout_s)
+        self._send_ok(job)
+        return True
+
+    def retrier(self):
+        cfg = self.cfg
+        while not self.stop.is_set():
+            time.sleep(0.2)
+            now = time.time()
+            with self._lock:
+                items = list(self.pending.items())
+            for mid, st in items:
+                if now < st["next"]:
+                    continue
+                if st["tries"] >= cfg.retry_count:
+                    log.error("RESULT %s unacknowledged after %d tries — giving up",
+                              mid, st["tries"])
+                    with self._lock:
+                        self.pending.pop(mid, None)
+                    continue
+                try:
+                    self.sock.sendto(st["data"], self.peer())
+                    st["tries"] += 1
+                    st["next"] = now + cfg.retry_delay_s
+                    log.info("retry %d for %s", st["tries"], mid)
+                except Exception as e:
+                    log.error("retry send failed: %s", e)
+
+    def heartbeat(self):
+        if self.cfg.heartbeat_s <= 0:
+            log.info("heartbeat disabled")
+            return
+        while not self.stop.is_set():
+            time.sleep(self.cfg.heartbeat_s)
+            if self.stop.is_set():
+                break
+            self.send({"type": "ALIVE", "msg_id": self._next_id(),
+                       "queue": self.q.qsize()})
+
+    def start(self):
+        """Launch all threads and return immediately (used by the GUI)."""
+        self.threads = [threading.Thread(target=t, daemon=True, name=t.__name__)
+                        for t in (self.receiver, self.worker,
+                                  self.retrier, self.heartbeat)]
+        for t in self.threads:
+            t.start()
+        log.info("service up — root=%s  reply=%s:%d",
+                 self.cfg.root, self.cfg.itcs_host, self.cfg.itcs_port)
+
+    def shutdown(self):
+        self.stop.set()
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+        log.info("service stopped")
+
+    def run(self):
+        """Blocking run, used by the command line."""
+        self.start()
+        try:
+            while True:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            log.info("shutting down")
+            self.shutdown()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="RIEE UDP validation service")
+    ap.add_argument("-c", "--config", default="service_config.ini")
+    ap.add_argument("--make-config", action="store_true",
+                    help="write a default config file and exit")
+    a = ap.parse_args()
+
+    if a.make_config:
+        with open(a.config, "w", encoding="utf-8") as f:
+            f.write(DEFAULT_CONFIG)
+        print(f"wrote {a.config}")
+        return 0
+
+    cfg = Config(a.config)
+    setup_logging(cfg)
+    if not os.path.isfile(a.config):
+        log.warning("config %s not found — using built-in defaults", a.config)
+    try:
+        Service(cfg).run()
+    except Exception:
+        log.exception("fatal")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
